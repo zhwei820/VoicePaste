@@ -47,6 +47,11 @@ namespace VoicePaste
         public static bool Debug = false;
         public static bool DebugKeys = false;
 
+        // Win 键会顺带把开始菜单/搜索叫到前台，语音文字可能上屏到那里
+        // （看起来就是「文字跑到 Windows 里去了」）。
+        // 开启后：说话期间检测到这类系统弹窗就自动关掉，并把焦点拉回捕获框。
+        public static bool CloseStartMenu = true;
+
         public static void Load(string path)
         {
             try
@@ -106,6 +111,10 @@ namespace VoicePaste
                         case "debug_keys":
                             DebugKeys = ParseBool(value, DebugKeys);
                             break;
+
+                        case "close_start_menu":
+                            CloseStartMenu = ParseBool(value, CloseStartMenu);
+                            break;
                     }
                 }
             }
@@ -145,6 +154,7 @@ namespace VoicePaste
         public const int VK_RMENU = 0xA5;
         public const int VK_V = 0x56;
         public const int VK_F24 = 0x87;
+        public const int VK_ESCAPE = 0x1B;
 
         public const int GCS_COMPSTR = 0x0008;
 
@@ -153,6 +163,7 @@ namespace VoicePaste
         public const int WM_KEYUP = 0x0101;
         public const int WM_SYSKEYDOWN = 0x0104;
         public const int WM_SYSKEYUP = 0x0105;
+        public const int WM_CLOSE = 0x0010;
 
         public const uint INPUT_KEYBOARD = 1;
         public const uint KEYEVENTF_KEYUP = 0x0002;
@@ -263,6 +274,20 @@ namespace VoicePaste
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
 
@@ -341,6 +366,119 @@ namespace VoicePaste
             {
                 return "";
             }
+        }
+
+        // -----------------------------------------------------------------
+        // 开始菜单 / 搜索（Win 键的副作用）
+        // -----------------------------------------------------------------
+        // Win 键按下时 Windows 会顺带弹出开始菜单/搜索，它可能抢走焦点，
+        // 微信语音的文字就上屏到搜索框里去了。这里识别出这些窗口，说话期间关掉它们。
+        static readonly string[] ShellPopupProcesses = new string[]
+        {
+            "StartMenuExperienceHost", "SearchHost", "SearchApp", "SearchUI",
+            "ShellExperienceHost"
+        };
+
+        static readonly Dictionary<uint, string> processNameCache = new Dictionary<uint, string>();
+
+        public static string GetProcessName(uint pid)
+        {
+            string name;
+            if (processNameCache.TryGetValue(pid, out name)) return name;
+
+            try { name = Process.GetProcessById((int)pid).ProcessName; }
+            catch { name = ""; }
+
+            if (processNameCache.Count > 200) processNameCache.Clear();
+            processNameCache[pid] = name;
+            return name;
+        }
+
+        public static bool IsShellPopup(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+
+            try
+            {
+                if (!IsWindow(hWnd) || !IsWindowVisible(hWnd)) return false;
+
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (pid == 0) return false;
+
+                string proc = GetProcessName(pid);
+                for (int i = 0; i < ShellPopupProcesses.Length; i++)
+                {
+                    if (string.Equals(proc, ShellPopupProcesses[i], StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        public static string GetClassNameOf(IntPtr hWnd)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder(256);
+                GetClassName(hWnd, sb, sb.Capacity);
+                return sb.ToString();
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        // 开台菜单/搜索被关掉后，焦点会掉到任务栏等外壳窗口上；这些也算“被抢走”。
+        public static bool IsShellUi(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return false;
+            if (IsShellPopup(hWnd)) return true;
+
+            string cls = GetClassNameOf(hWnd);
+            return cls == "Shell_TrayWnd"
+                || cls == "Shell_SecondaryTrayWnd"
+                || cls == "LauncherTipWnd"
+                || cls == "TopLevelWindowForOverflowXamlIsland";
+        }
+
+        // 优先看前台窗口，其次再枚举所有可见的顶层窗口。
+        public static IntPtr FindShellPopup()
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (IsShellPopup(fg)) return fg;
+
+            IntPtr found = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!IsWindowVisible(h)) return true;
+                if (!IsShellPopup(h)) return true;
+
+                found = h;
+                return false;
+            }, IntPtr.Zero);
+
+            return found;
+        }
+
+        // 关掉开始菜单/搜索：先发 WM_CLOSE，关不掉时调用方再用 Esc 兜底。
+        public static bool DismissShellPopup(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero || !IsShellPopup(hWnd)) return false;
+
+            PostMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            return true;
+        }
+
+        public static void SendEscape()
+        {
+            SendKey(VK_ESCAPE, false);
+            SendKey(VK_ESCAPE, true);
         }
 
         // 切换前台窗口。对 Win10/11 来说，只调用 SetForegroundWindow 常常会失败，
@@ -903,6 +1041,16 @@ namespace VoicePaste
         int lastHookPingTick;
         int hookReinstallCount;
 
+        // 说话期间盯着前台窗口：Win 键会带出开始菜单/搜索，
+        // 语音文字一旦上屏到那里就进不了捕获框。
+        Timer focusGuard;
+        IntPtr lastRealForeground = IntPtr.Zero;
+        IntPtr lastGuardForeground = IntPtr.Zero;
+        IntPtr lastDismissedPopup = IntPtr.Zero;
+        int dismissTick;
+        int dismissTries;
+        int popupWaits;
+
         NotifyIcon tray;
 
         public CaptureForm(string lp)
@@ -949,6 +1097,10 @@ namespace VoicePaste
             hookWatchdog = new Timer();
             hookWatchdog.Interval = 1000;
             hookWatchdog.Tick += WatchdogTick;
+
+            focusGuard = new Timer();
+            focusGuard.Interval = 100;
+            focusGuard.Tick += GuardTick;
 
             // 托盘图标：程序没有可见窗口，靠它确认“还活着”，也提供退出入口。
             ContextMenuStrip menu = new ContextMenuStrip();
@@ -1048,6 +1200,9 @@ namespace VoicePaste
                 hookWatchdog.Start();
             }
 
+            focusGuard.Start();
+            Log("系统弹窗守卫（开始菜单/搜索）: " + (Config.CloseStartMenu ? "已启用" : "已关闭"));
+
             return hookHandle != IntPtr.Zero;
         }
 
@@ -1136,6 +1291,85 @@ namespace VoicePaste
 
             Native.SendKey(Native.VK_F24, false);
             Native.SendKey(Native.VK_F24, true);
+        }
+
+        // -----------------------------------------------------------------
+        // 系统弹窗守卫（开始菜单 / 搜索）
+        // -----------------------------------------------------------------
+        // Win 键是热键的一部分，不可避免会被 Windows 看到，于是开始菜单/搜索
+        // 有时会被带出来抢走焦点：语音文字上屏到搜索框，或者粘贴目标变成搜索框。
+        // 这里在说话/等识别/粘贴期间盯着它，一出现就关掉并把焦点拉回来。
+        void GuardTick(object sender, EventArgs e)
+        {
+            IntPtr fg = Native.GetForegroundWindow();
+
+            // 记住最近一个“真正属于用户的窗口”，供按热键时前台已被开始菜单抢走的情况兜底。
+            if (fg != IntPtr.Zero && fg != Handle && Native.IsWindow(fg) && !Native.IsShellPopup(fg))
+                lastRealForeground = fg;
+
+            bool active = state == SessionState.Capturing
+                || state == SessionState.Waiting
+                || state == SessionState.Pasting;
+            if (!active)
+            {
+                lastGuardForeground = IntPtr.Zero;
+                lastDismissedPopup = IntPtr.Zero;
+                dismissTries = 0;
+                return;
+            }
+
+            if (Config.Debug && fg != lastGuardForeground)
+            {
+                lastGuardForeground = fg;
+                Log("前台窗口: " + Native.GetWindowTitle(fg)
+                    + " / 0x" + fg.ToInt64().ToString("X")
+                    + (Native.IsShellUi(fg) ? "（系统弹窗）" : ""));
+            }
+
+            if (!Config.CloseStartMenu) return;
+
+            // 说话期间焦点一旦跑到开始菜单/搜索（或被关掉后掉到任务栏），
+            // 就把焦点抢回捕获框。开始菜单是异步关闭的，关掉后焦点可能先落
+            // 到任务栏上，所以每个 tick 都重新抢，直到真的回到捕获框。
+            if (!Native.IsShellUi(fg)) return;
+
+            IntPtr popup = Native.IsShellPopup(fg) ? fg : IntPtr.Zero;
+
+            if (popup == IntPtr.Zero)
+            {
+                lastDismissedPopup = IntPtr.Zero;
+                dismissTries = 0;
+            }
+            else
+            {
+                int now = Environment.TickCount;
+                if (popup != lastDismissedPopup)
+                {
+                    lastDismissedPopup = popup;
+                    dismissTries = 0;
+                    dismissTick = now - 1000; // 第一次立刻动手
+                    Log("检测到 Windows 开始菜单/搜索（" + Native.GetWindowTitle(popup)
+                        + "），正在关闭并把焦点拉回捕获框");
+                }
+
+                if (now - dismissTick >= 200)
+                {
+                    dismissTick = now;
+                    dismissTries++;
+
+                    Native.DismissShellPopup(popup);
+                    // WM_CLOSE 对 Win11 的开始菜单不一定管用，连续关不掉时用 Esc 兜底。
+                    if (dismissTries >= 4 && dismissTries % 4 == 0)
+                        Native.SendEscape();
+                }
+            }
+
+            if ((state == SessionState.Capturing || state == SessionState.Waiting)
+                && Native.GetForegroundWindow() != Handle)
+            {
+                Native.ForceForeground(Handle);
+                box.Focus();
+            }
         }
 
         IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1338,7 +1572,27 @@ namespace VoicePaste
 
             // 重试时不能把捕获框自己当成目标窗口。
             if (!retry)
-                targetWindow = Native.GetForegroundWindow();
+            {
+                IntPtr fg = Native.GetForegroundWindow();
+
+                // Win 键会把开始菜单/搜索叫到前台，此时前台并不是用户真正想
+                // 输入文字的窗口：粘过去就会“跑进 Windows 搜索框”。
+                if (Native.IsShellPopup(fg))
+                {
+                    Log("按热键时前台是开始菜单/搜索（" + Native.GetWindowTitle(fg)
+                        + "），改用上一次的真实窗口作为粘贴目标");
+
+                    if (Config.CloseStartMenu) Native.DismissShellPopup(fg);
+
+                    fg = (lastRealForeground != IntPtr.Zero
+                          && Native.IsWindow(lastRealForeground)
+                          && !Native.IsShellPopup(lastRealForeground))
+                        ? lastRealForeground
+                        : IntPtr.Zero;
+                }
+
+                targetWindow = fg;
+            }
             state = SessionState.Capturing;
 
             pendingText = "";
@@ -1347,6 +1601,7 @@ namespace VoicePaste
             lastComposedAt = DateTime.UtcNow;
             loggedWait = false;
             pasteWaits = 0;
+            popupWaits = 0;
             savedClipboardValid = false;
             savedClipboardText = null;
 
@@ -1406,6 +1661,13 @@ namespace VoicePaste
 
         void ShowCapture()
         {
+            // 先把可能抢到前台的开台菜单/搜索关掉，再抢焦点。
+            if (Config.CloseStartMenu)
+            {
+                IntPtr fg = Native.GetForegroundWindow();
+                if (Native.IsShellPopup(fg)) Native.DismissShellPopup(fg);
+            }
+
             box.Clear();
             TopMost = true;
             Show();
@@ -1662,6 +1924,7 @@ namespace VoicePaste
 
             state = SessionState.Pasting;
             pasteWaits = 0;
+            popupWaits = 0;
             pasteTimer.Interval = 30;
             pasteTimer.Start();
         }
@@ -1685,6 +1948,35 @@ namespace VoicePaste
             }
 
             pasteTimer.Stop();
+
+            // 粘贴前如果开始菜单/搜索在前台，Ctrl+V 就会粘进搜索框。
+            // 先把它关掉再粘；实在关不掉就不粘，文字留在剪贴板。
+            if (Config.CloseStartMenu && Native.IsShellPopup(Native.GetForegroundWindow()))
+            {
+                IntPtr popup = Native.GetForegroundWindow();
+                popupWaits++;
+
+                if (popupWaits == 1)
+                    Log("粘贴前检测到开始菜单/搜索，先关闭再粘贴");
+
+                Native.DismissShellPopup(popup);
+                if (popupWaits >= 3) Native.SendEscape();
+
+                if (popupWaits <= 10)
+                {
+                    pasteTimer.Interval = 60;
+                    pasteTimer.Start();
+                    return;
+                }
+
+                string blocked = "开始菜单/搜索关不掉，已取消自动粘贴，文字已保留在剪贴板";
+                Log(blocked);
+                Console.WriteLine("[警告] " + blocked);
+
+                HideCapture();
+                ResetSession();
+                return;
+            }
 
             if (targetWindow == IntPtr.Zero || !Native.IsWindow(targetWindow))
             {
@@ -1773,6 +2065,9 @@ namespace VoicePaste
             lastText = "";
             loggedWait = false;
             pasteWaits = 0;
+            popupWaits = 0;
+            lastDismissedPopup = IntPtr.Zero;
+            dismissTries = 0;
             savedClipboardValid = false;
             savedClipboardText = null;
             targetWindow = IntPtr.Zero;
@@ -1851,6 +2146,7 @@ namespace VoicePaste
             pasteTimer.Stop();
             restoreTimer.Stop();
             hookWatchdog.Stop();
+            focusGuard.Stop();
 
             ReleaseVoiceTrigger();
             logicalTalking = false;
@@ -1878,6 +2174,7 @@ namespace VoicePaste
                 pasteTimer.Dispose();
                 restoreTimer.Dispose();
                 hookWatchdog.Dispose();
+                focusGuard.Dispose();
 
                 if (tray != null)
                 {
