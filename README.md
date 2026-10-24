@@ -157,11 +157,21 @@ install-autostart.bat
 
 ### 编译
 
-用 Windows 自带的 `csc`（兼容 C# 5）：
+推荐直接用 `build.bat`（自动定位 `csc.exe`，编译成功后才替换旧 exe，程序在运行时自动先结束进程）：
 
 ```bat
-csc.exe /nologo /optimize+ /t:winexe /out:VoicePaste.exe VoicePaste.cs
+build.bat            :: Release 版，自动结束运行中的 VoicePaste.exe
+build.bat nokill     :: 不结束进程（程序在跑时只生成 VoicePaste.build.exe）
+build.bat debug      :: 不优化编译
 ```
+
+PowerShell 里用 `.\build.bat`。也可以手动调用 Windows 自带的 `csc`（兼容 C# 5）：
+
+```bat
+"%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize+ /t:winexe /out:VoicePaste.exe VoicePaste.cs
+```
+
+> `csc.exe` 不在 PATH 里，直接敲 `csc` 会提示「无法识别」。
 
 ## 文件说明
 
@@ -169,6 +179,7 @@ csc.exe /nologo /optimize+ /t:winexe /out:VoicePaste.exe VoicePaste.cs
 | --- | --- |
 | `VoicePaste.cs` | 全部源码（配置、Win32 互操作、捕获窗口、键盘钩子、主程序） |
 | `voicepaste.conf` | 配置文件 |
+| `build.bat` | 编译脚本（Release / nokill / debug） |
 | `install-autostart.bat` | 设置开机自启（在「启动」文件夹创建快捷方式） |
 | `uninstall-autostart.bat` | 取消开机自启 |
 | `VoicePaste.exe` | 编译产物（未纳入版本库） |
