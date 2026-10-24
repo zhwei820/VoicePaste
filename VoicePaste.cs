@@ -52,6 +52,11 @@ namespace VoicePaste
         // 开启后：说话期间检测到这类系统弹窗就自动关掉，并把焦点拉回捕获框。
         public static bool CloseStartMenu = true;
 
+        // 息屏热键：例如 Alt+L。按这个组合只关闭显示器、不锁屏，
+        // 动一下鼠标或按任意键就回到原来的桌面（不用输密码）。
+        // 留空 = 关闭该功能。注意：不锁屏 = 离开座位时电脑不设防。
+        public static string ScreenOffHotkey = "";
+
         public static void Load(string path)
         {
             try
@@ -115,6 +120,15 @@ namespace VoicePaste
                         case "close_start_menu":
                             CloseStartMenu = ParseBool(value, CloseStartMenu);
                             break;
+
+                        case "screen_off_hotkey":
+                            ScreenOffHotkey = value;
+                            break;
+
+                        // 旧配置名（早期版本只能写 Win+L）
+                        case "win_l_screen_off":
+                            ScreenOffHotkey = ParseBool(value, false) ? "Win+L" : "";
+                            break;
                     }
                 }
             }
@@ -153,7 +167,9 @@ namespace VoicePaste
         public const int VK_LMENU = 0xA4;
         public const int VK_RMENU = 0xA5;
         public const int VK_V = 0x56;
+        public const int VK_L = 0x4C;
         public const int VK_F24 = 0x87;
+        public const int VK_NONAME = 0xFC; // 未分配的虚拟键：注入它不会有任何副作用
         public const int VK_ESCAPE = 0x1B;
 
         public const int GCS_COMPSTR = 0x0008;
@@ -164,6 +180,14 @@ namespace VoicePaste
         public const int WM_SYSKEYDOWN = 0x0104;
         public const int WM_SYSKEYUP = 0x0105;
         public const int WM_CLOSE = 0x0010;
+        public const int WM_SYSCOMMAND = 0x0112;
+        public const int SC_MONITORPOWER = 0xF170;
+
+        // WM_SYSCOMMAND / SC_MONITORPOWER 的 lParam：2 = 关闭显示器，-1 = 打开
+        public const int MONITOR_OFF = 2;
+
+        public const uint SMTO_ABORTIFHUNG = 0x0002;
+        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
 
         public const uint INPUT_KEYBOARD = 1;
         public const uint KEYEVENTF_KEYUP = 0x0002;
@@ -293,6 +317,11 @@ namespace VoicePaste
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        // 广播 SC_MONITORPOWER 关闭显示器（不锁屏、不休眠）。
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessageTimeout(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam,
+            uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
         [DllImport("imm32.dll")]
         public static extern IntPtr ImmGetContext(IntPtr hWnd);
@@ -1035,11 +1064,23 @@ namespace VoicePaste
         IntPtr hookHandle = IntPtr.Zero;
         Native.LowLevelKeyboardProc hookProc;
 
+        // ---- 息屏热键（默认 Alt+L）→ 只息屏不锁屏 ----
+        // 做法：把主键（L）的按下/松开都吞掉（否则会往文档里打字母；如果是
+        // Win+L，吞掉后 winlogon 也就收不到，锁屏不会发生）。等组合键全部
+        // 松开约 250ms 后再关屏，免得剩下的按键事件把屏幕又唤醒。
+        // 组合里含 Win 时，Win 的松开还要额外处理，见 HandleScreenOffKey。
+        HotkeySpec screenOffSpec;
+        bool screenOffArmed;
+        int screenOffWinVk;        // 组合里的 Win 键（左/右），0 = 组合里没有 Win
+        bool screenOffWinInjected; // Win 松开已吞掉并补发了注入松开
+        bool screenOffPending;     // 待关屏（等按键事件处理完）
+        int screenOffTick;
+        int screenOffGuardUntil;   // 含 Win 时：息屏后短暂盯住开始菜单
+        int screenOffGuardRetries;
+
         // Windows 7+ 在低层钩子回调超时后会静默卸载钩子（之后热键就完全没反应）。
-        // 这里每 2 秒注入一个无害的 F24 探一下钩子是否还活着，死了就自动重装。
+        // 这里定期直接重装钩子来兜底（不注入按键，见 WatchdogTick）。
         Timer hookWatchdog;
-        int lastHookPingTick;
-        int hookReinstallCount;
 
         // 说话期间盯着前台窗口：Win 键会带出开始菜单/搜索，
         // 语音文字一旦上屏到那里就进不了捕获框。
@@ -1056,6 +1097,10 @@ namespace VoicePaste
         public CaptureForm(string lp)
         {
             logPath = lp;
+
+            // 息屏热键要先解析：下面的托盘菜单会根据它决定是否显示
+            // 「关闭显示器（测试）」这一项。
+            ParseScreenOffHotkey();
 
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -1095,7 +1140,7 @@ namespace VoicePaste
             restoreTimer.Tick += RestoreTick;
 
             hookWatchdog = new Timer();
-            hookWatchdog.Interval = 1000;
+            hookWatchdog.Interval = 5000;
             hookWatchdog.Tick += WatchdogTick;
 
             focusGuard = new Timer();
@@ -1112,6 +1157,8 @@ namespace VoicePaste
             {
                 OpenPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "voicepaste.conf"));
             });
+            if (screenOffSpec != null)
+                menu.Items.Add("关闭显示器（测试）", null, delegate { TurnOffMonitor(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出 VoicePaste", null, delegate { DoExit(); });
 
@@ -1196,14 +1243,29 @@ namespace VoicePaste
 
             if (hookHandle != IntPtr.Zero)
             {
-                lastHookPingTick = Environment.TickCount;
                 hookWatchdog.Start();
             }
 
             focusGuard.Start();
             Log("系统弹窗守卫（开始菜单/搜索）: " + (Config.CloseStartMenu ? "已启用" : "已关闭"));
+            Log("息屏热键（只关显示器，不锁屏）: "
+                + (screenOffSpec != null ? screenOffSpec.Spec : "未启用"));
 
             return hookHandle != IntPtr.Zero;
+        }
+
+        // 解析息屏热键（例如 Alt+L）：留空 = 不启用。
+        void ParseScreenOffHotkey()
+        {
+            screenOffSpec = null;
+            if (Config.ScreenOffHotkey.Length == 0) return;
+
+            string error;
+            if (!HotkeySpec.TryParse(Config.ScreenOffHotkey, out screenOffSpec, out error))
+            {
+                Log("息屏热键无法解析: " + Config.ScreenOffHotkey + "（" + error + "），已忽略");
+                screenOffSpec = null;
+            }
         }
 
         void SyncPhysicalState()
@@ -1228,6 +1290,11 @@ namespace VoicePaste
         // -----------------------------------------------------------------
         void InstallKeyboardHook()
         {
+            InstallKeyboardHook(false);
+        }
+
+        void InstallKeyboardHook(bool quiet)
+        {
             try
             {
                 hookProc = HookCallback;
@@ -1247,7 +1314,7 @@ namespace VoicePaste
                     Log("键盘钩子安装失败，错误码 " + Marshal.GetLastWin32Error());
                     Console.WriteLine("[错误] 键盘钩子安装失败");
                 }
-                else
+                else if (!quiet)
                 {
                     Log("已安装键盘钩子，说话热键: " + talkSpec.Spec);
                 }
@@ -1270,27 +1337,21 @@ namespace VoicePaste
 
         void WatchdogTick(object sender, EventArgs e)
         {
-            uint since = unchecked((uint)(Environment.TickCount - lastHookPingTick));
-
-            if (hookHandle == IntPtr.Zero || since > 3000)
+            // 早先的做法是每秒注入一个 F24 来探测钩子是否还活着，但注入的按键
+            // 同样会被系统当成“用户输入”：显示器刚熄灭就被它重新点亮，而且
+            // 会让电源计划里的“多久后关闭显示器”永远不生效。所以改成定期
+            // 直接重装钩子，全程不产生任何输入。
+            if (logicalTalking
+                || state == SessionState.Capturing
+                || state == SessionState.Pasting)
             {
-                hookReinstallCount++;
-                if (hookReinstallCount <= 3 || hookReinstallCount % 20 == 0)
-                {
-                    Log("键盘钩子无响应（系统可能已静默卸载），自动重新安装"
-                        + "（第 " + hookReinstallCount + " 次）");
-                }
-
-                RemoveKeyboardHook();
-                // 重新读取真实按键状态，避免漏掉松键导致的“卡住”状态。
-                SyncPhysicalState();
-                InstallKeyboardHook();
-                lastHookPingTick = Environment.TickCount;
-                return;
+                return; // 说话/粘贴期间不动钩子，避免漏键
             }
 
-            Native.SendKey(Native.VK_F24, false);
-            Native.SendKey(Native.VK_F24, true);
+            RemoveKeyboardHook();
+            // 重装前按真实按键状态同步一次，避免漏掉松键导致的“卡住”状态。
+            SyncPhysicalState();
+            InstallKeyboardHook(true);
         }
 
         // -----------------------------------------------------------------
@@ -1306,6 +1367,34 @@ namespace VoicePaste
             // 记住最近一个“真正属于用户的窗口”，供按热键时前台已被开始菜单抢走的情况兜底。
             if (fg != IntPtr.Zero && fg != Handle && Native.IsWindow(fg) && !Native.IsShellPopup(fg))
                 lastRealForeground = fg;
+
+            // ---- Win+L 息屏 ----
+            // 关屏要等按键事件都处理完（否则紧随其后的 Win 松开会把屏幕唤醒）。
+            if (screenOffPending && unchecked(Environment.TickCount - screenOffTick) >= 250)
+            {
+                screenOffPending = false;
+                TurnOffMonitor();
+            }
+
+            // 息屏后短暂盯一下：万一开始了菜单还是被叫出来了（例如注入的
+            // VK_NONAME 因某些系统设置没起到作用），趁屏幕黑着把它关掉，
+            // 免得唤醒后看到的是开始菜单。不用 Esc：那是真实输入，会把屏幕唤醒。
+            if (screenOffGuardUntil != 0)
+            {
+                if (unchecked(Environment.TickCount - screenOffGuardUntil) >= 0)
+                {
+                    screenOffGuardUntil = 0;
+                    screenOffGuardRetries = 0;
+                }
+                else if (Native.IsShellPopup(fg))
+                {
+                    screenOffGuardRetries++;
+                    Native.DismissShellPopup(fg);
+                    if (lastRealForeground != IntPtr.Zero && Native.IsWindow(lastRealForeground))
+                        Native.ForceForeground(lastRealForeground);
+                    return;
+                }
+            }
 
             bool active = state == SessionState.Capturing
                 || state == SessionState.Waiting
@@ -1389,13 +1478,6 @@ namespace VoicePaste
                     bool ourInjection = injected && info.dwExtraInfo == Native.InjectionSignature;
                     int vk = (int)info.vkCode;
 
-                    // 本程序注入的 F24 只是心跳：记一笔并吞掉，不参与热键逻辑。
-                    if (ourInjection && vk == Native.VK_F24)
-                    {
-                        if (isDown) lastHookPingTick = Environment.TickCount;
-                        return (IntPtr)1;
-                    }
-
                     // 只忽略本程序自己注入的按键，避免误触发和递归；
                     // 其他程序（例如键盘映射工具）注入的按键仍然当作正常输入。
                     if (Config.DebugKeys)
@@ -1413,6 +1495,10 @@ namespace VoicePaste
 
                         if (isDown) physDown[vk] = true;
                         else physDown[vk] = false;
+
+                        // Win+L：只息屏，不锁屏。吞掉的键不进入后续热键逻辑。
+                        if (HandleScreenOffKey(vk, isDown, wasDown))
+                            return (IntPtr)1;
 
                         if (isTalkKey)
                         {
@@ -1496,6 +1582,122 @@ namespace VoicePaste
             }
 
             return Native.CallNextHookEx(hookHandle, nCode, wParam, lParam);
+        }
+
+        // 息屏热键（默认 Alt+L）→ 只息屏不锁屏。返回 true 表示这个按键已被吞掉。
+        bool HandleScreenOffKey(int vk, bool isDown, bool wasDown)
+        {
+            if (screenOffSpec == null || screenOffSpec.MainVk == 0) return false;
+
+            bool isMain = vk == screenOffSpec.MainVk;
+
+            if (isDown)
+            {
+                // 组合键已触发：主键的自动重复也一并吞掉，否则会打出一串字母。
+                if (screenOffArmed)
+                {
+                    if (!isMain) return false;
+                    deliveredDown[vk] = false;
+                    return true;
+                }
+
+                // 组合键凑齐的那一下：吞掉主键（不写进文档；若是 Win+L，
+                // winlogon 收不到 L，锁屏也就不会发生）。
+                if (isMain && !wasDown && screenOffSpec.IsSatisfied(physDown)
+                    && !logicalTalking
+                    && (state == SessionState.Idle || state == SessionState.Waiting))
+                {
+                    screenOffArmed = true;
+                    screenOffWinInjected = false;
+                    screenOffWinVk = screenOffSpec.NeedWin
+                        ? (physDown[Native.VK_LWIN] ? Native.VK_LWIN : Native.VK_RWIN)
+                        : 0;
+                    deliveredDown[vk] = false;
+                    Log("息屏热键 " + screenOffSpec.Spec + "：关闭显示器（不锁屏）");
+                    return true;
+                }
+
+                return false;
+            }
+
+            bool swallow = false;
+
+            // 主键松开：跟按下保持一致，一并吞掉。
+            if (isMain && screenOffArmed)
+            {
+                swallow = true;
+                deliveredDown[vk] = false;
+            }
+            else if (screenOffArmed && !screenOffWinInjected
+                     && screenOffWinVk != 0 && vk == screenOffWinVk)
+            {
+                // 组合里有 Win 时，Win 的松开不能直接放行：一是松开的一瞬会把
+                // 屏幕唤醒，二是“Win 被单独点一下”会弹出开始菜单（实测）。
+                // 但只吞不放又会让系统以为 Win 一直按着，之后按键全变 Win+X
+                // （实测），所以吞掉后补发“注入的 Win 松开”；为了让系统不把
+                // 它当成“Win 单独按了一下”，先注入一个无副作用的 VK_NONAME。
+                swallow = true;
+                deliveredDown[vk] = false;
+
+                bool injected = Native.SendKey(Native.VK_NONAME, false);
+                injected = Native.SendKey(Native.VK_NONAME, true) && injected;
+                injected = Native.SendKey(screenOffWinVk, true) && injected;
+                screenOffWinInjected = true;
+
+                if (!injected)
+                {
+                    // 前台是提权窗口时 UIPI 会拦住 SendInput：宁可放行真实松开
+                    // （会亮屏/弹开始菜单），也不能让 Win 键卡住。
+                    Log("息屏热键：注入按键被 UIPI 拦下，放行 Win 松开（可能会亮屏）");
+                    deliveredDown[vk] = true;
+                }
+            }
+
+            // 组合键全部松开后，再等一小会儿关屏：让剩下的按键事件先处理完，
+            // 否则一关屏就被这些事件立刻唤醒。
+            if (screenOffArmed && !AnyScreenOffKeyDown())
+            {
+                screenOffArmed = false;
+                screenOffWinVk = 0;
+                screenOffWinInjected = false;
+
+                screenOffPending = true;
+                screenOffTick = Environment.TickCount;
+
+                if (screenOffSpec.NeedWin)
+                {
+                    screenOffGuardUntil = Environment.TickCount + 2000;
+                    screenOffGuardRetries = 0;
+                }
+            }
+
+            return swallow;
+        }
+
+        bool AnyScreenOffKeyDown()
+        {
+            for (int vk = 0; vk < 256; vk++)
+            {
+                if (physDown[vk] && screenOffSpec.IsPartOfHotkey(vk)) return true;
+            }
+            return false;
+        }
+
+        // 只关闭显示器（不锁屏、不休眠）：动鼠标或按任意键即亮屏，回到原来的桌面。
+        void TurnOffMonitor()
+        {
+            try
+            {
+                IntPtr unused;
+                Native.SendMessageTimeout(Native.HWND_BROADCAST, Native.WM_SYSCOMMAND,
+                    new IntPtr(Native.SC_MONITORPOWER), new IntPtr(Native.MONITOR_OFF),
+                    Native.SMTO_ABORTIFHUNG, 1000, out unused);
+                Log("显示器已关闭（未锁屏）：动一下鼠标或按任意键唤醒");
+            }
+            catch (Exception ex)
+            {
+                Log("关闭显示器失败: " + ex.Message);
+            }
         }
 
         void Post(Action action)
