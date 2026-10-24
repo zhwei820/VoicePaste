@@ -358,25 +358,41 @@ namespace VoicePaste
                 bool keyUp = (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP);
                 if (keyDown || keyUp)
                 {
-                    var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
-                    if (info.vkCode == talkVk)
+                    if (talkVk == 0)
                     {
-                        // 检查修饰键是否满足
-                        bool modOk = ModifiersMatch(talkMod);
-                        // 松开幕键（talkVk）的 keyup。注意：松开时修饰键可能已经被先释放；为宽容起见，
-                        // 只要在松开 talkVk 且 modOk 时结束，或者用 talking 状态兜底。
-                        if (keyDown && modOk && !talking)
+                        // 纯修饰键组合（如 Win+Alt）：根据整体按下状态判定开始/结束
+                        bool full = ModifiersMatch(talkMod);
+                        if (!talking && full)
                         {
                             talking = true;
-                            // 吞掉此按下事件，避免按键传给目标窗口造成误输入
                             OnTalkDown();
                             return (IntPtr)1;
                         }
-                        else if (keyUp && talking)
+                        if (talking && !full)
                         {
                             talking = false;
                             OnTalkUp();
                             return (IntPtr)1;
+                        }
+                    }
+                    else
+                    {
+                        var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
+                        if (info.vkCode == talkVk)
+                        {
+                            bool modOk = ModifiersMatch(talkMod);
+                            if (keyDown && modOk && !talking)
+                            {
+                                talking = true;
+                                OnTalkDown();
+                                return (IntPtr)1;
+                            }
+                            else if (keyUp && talking)
+                            {
+                                talking = false;
+                                OnTalkUp();
+                                return (IntPtr)1;
+                            }
                         }
                     }
                 }
@@ -392,9 +408,9 @@ namespace VoicePaste
             bool win = (mod & Native.MOD_WIN) != 0;
 
             bool ctrlDown = Native.IsKeyDown(Native.VK_CONTROL);
-            bool altDown = Native.IsKeyDown(0x12);   // VK_MENU
+            bool altDown = Native.IsKeyDown(0xA4);   // VK_LMENU（左 Alt）
             bool shiftDown = Native.IsKeyDown(0x10);  // VK_SHIFT
-            bool winDown = Native.IsKeyDown(Native.VK_LWIN) || Native.IsKeyDown(0x5C); // LWIM/RWIM
+            bool winDown = Native.IsKeyDown(Native.VK_LWIN) || Native.IsKeyDown(0x5C); // 左/右 Win
 
             if (ctrl != ctrlDown) return false;
             if (alt != altDown) return false;
@@ -445,7 +461,7 @@ namespace VoicePaste
                         return false;
                 }
             }
-            return vk != 0;
+            return (mod != 0 || vk != 0);
         }
 
         // -----------------------------------------------------------------
