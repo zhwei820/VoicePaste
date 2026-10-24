@@ -254,40 +254,44 @@ namespace VoicePaste
             box.Dock = DockStyle.Fill;
             box.Font = new Font("Microsoft YaHei UI", 12f);
             Controls.Add(box);
-
-            HandleCreated += (s, e) => InstallKeyboardHook();
-            FormClosed += (s, e) => RemoveKeyboardHook();
         }
 
         // -----------------------------------------------------------------
         // 热键解析 / 键盘钩子
         // -----------------------------------------------------------------
-        void InstallKeyboardHook()
+        public void InstallKeyboardHook()
         {
-            uint mod, vk;
-            if (!TryParseHotkey(Config.TalkHotkey, out mod, out vk))
+            try
             {
-                Log("说话热键解析失败: " + Config.TalkHotkey);
-                Console.WriteLine("[错误] 说话热键格式无法解析: " + Config.TalkHotkey + "（示例: Win+Alt 或 Ctrl+Alt+W）");
-                return;
-            }
-            talkMod = mod;
-            talkVk = vk;
-            hotkeyHasWin = (mod & Native.MOD_WIN) != 0;
-            wantWin = hotkeyHasWin;
-            wantAlt = (mod & Native.MOD_ALT) != 0;
+                uint mod, vk;
+                if (!TryParseHotkey(Config.TalkHotkey, out mod, out vk))
+                {
+                    Log("说话热键解析失败: " + Config.TalkHotkey);
+                    Console.WriteLine("[错误] 说话热键格式无法解析: " + Config.TalkHotkey + "（示例: Win+Alt 或 Ctrl+Alt+W）");
+                    return;
+                }
+                talkMod = mod;
+                talkVk = vk;
+                hotkeyHasWin = (mod & Native.MOD_WIN) != 0;
+                wantWin = hotkeyHasWin;
+                wantAlt = (mod & Native.MOD_ALT) != 0;
 
-            hookProc = HookCallback;
-            using (var cur = System.Diagnostics.Process.GetCurrentProcess())
-            using (var mainModule = cur.MainModule)
-            {
-                hookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc,
-                    Native.GetModuleHandle(mainModule.ModuleName), 0);
+                hookProc = HookCallback;
+                using (var cur = System.Diagnostics.Process.GetCurrentProcess())
+                using (var mainModule = cur.MainModule)
+                {
+                    hookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, hookProc,
+                        Native.GetModuleHandle(mainModule.ModuleName), 0);
+                }
+                if (hookHandle == IntPtr.Zero)
+                    Log("键盘钩子安装失败，错误码 " + Marshal.GetLastWin32Error());
+                else
+                    Log("已安装键盘钩子，说话热键: " + Config.TalkHotkey);
             }
-            if (hookHandle == IntPtr.Zero)
-                Log("键盘钩子安装失败，错误码 " + Marshal.GetLastWin32Error());
-            else
-                Log("已安装键盘钩子，说话热键: " + Config.TalkHotkey);
+            catch (Exception ex)
+            {
+                Log("键盘钩子安装异常: " + ex.Message);
+            }
         }
 
         void RemoveKeyboardHook()
@@ -639,8 +643,9 @@ namespace VoicePaste
 
             using (var form = new CaptureForm(logPath))
             {
-                // 强制创建句柄，触发钩子安装
+                // 强制创建窗口句柄，并显式安装键盘钩子
                 form.CreateControl();
+                form.InstallKeyboardHook();
 
                 Console.WriteLine();
                 Console.WriteLine("==============================================");
