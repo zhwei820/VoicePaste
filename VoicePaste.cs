@@ -40,6 +40,7 @@ namespace VoicePaste
         public static string TalkHotkey = "Shift+Alt";
         public static string VoiceTriggerHotkey = "Win+Alt";
         public static int CommitDelayMs = 600;
+        public static int NoTextTimeoutMs = 15000;
         public static bool PasteOnFinish = true;
         public static bool RestoreClipboard = false;
         public static bool Debug = false;
@@ -77,6 +78,14 @@ namespace VoicePaste
                                 int delay;
                                 if (int.TryParse(value, out delay) && delay >= 0 && delay <= 60000)
                                     CommitDelayMs = delay;
+                                break;
+                            }
+
+                        case "no_text_timeout_ms":
+                            {
+                                int timeout;
+                                if (int.TryParse(value, out timeout) && timeout >= 1000 && timeout <= 120000)
+                                    NoTextTimeoutMs = timeout;
                                 break;
                             }
 
@@ -130,6 +139,8 @@ namespace VoicePaste
         public const int VK_RMENU = 0xA5;
         public const int VK_V = 0x56;
         public const int VK_F24 = 0x87;
+
+        public const int GCS_COMPSTR = 0x0008;
 
         public const int WH_KEYBOARD_LL = 13;
         public const int WM_KEYDOWN = 0x0100;
@@ -251,6 +262,48 @@ namespace VoicePaste
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("imm32.dll")]
+        public static extern IntPtr ImmGetContext(IntPtr hWnd);
+
+        [DllImport("imm32.dll")]
+        public static extern bool ImmReleaseContext(IntPtr hWnd, IntPtr hIMC);
+
+        [DllImport("imm32.dll", CharSet = CharSet.Unicode, EntryPoint = "ImmGetCompositionStringW")]
+        public static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, byte[] lpBuf, int dwBufLen);
+
+        // 读取控件当前正在输入的 IME 合成串（例如微信语音实时上屏的文字）。
+        // WinForms 的 TextBox.Text 不包含合成串，必须单独读。
+        public static string GetCompositionText(IntPtr hWnd)
+        {
+            IntPtr himc = IntPtr.Zero;
+            try
+            {
+                himc = ImmGetContext(hWnd);
+                if (himc == IntPtr.Zero) return "";
+
+                int size = ImmGetCompositionString(himc, GCS_COMPSTR, null, 0);
+                if (size <= 0) return "";
+
+                byte[] buffer = new byte[size];
+                int written = ImmGetCompositionString(himc, GCS_COMPSTR, buffer, buffer.Length);
+                if (written <= 0) return "";
+
+                return Encoding.Unicode.GetString(buffer, 0, written);
+            }
+            catch
+            {
+                return "";
+            }
+            finally
+            {
+                if (himc != IntPtr.Zero)
+                {
+                    try { ImmReleaseContext(hWnd, himc); }
+                    catch { }
+                }
+            }
+        }
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -762,7 +815,6 @@ namespace VoicePaste
     // =====================================================================
     public sealed class CaptureForm : Form
     {
-        const int NoTextTimeoutMs = 5000;
 
         enum SessionState
         {
@@ -805,10 +857,19 @@ namespace VoicePaste
 
         // 模拟语音热键时真正由我们按下的键
         bool triggerActive;
+        bool pendingTriggerRelease;
         readonly List<int> injectedTriggerKeys = new List<int>();
+
+        // 记录最近一次看到的“编辑框文本 + IME 合成串”。
+        // 微信输入法的语音结果先往 IME 合成串里写，TextBox.Text 看不到；
+        // 合成串有时不会提交就直接被清空，所以这里备份一下。
+        string lastComposedText = "";
+        DateTime lastComposedAt;
 
         // 物理按键状态（忽略 SendInput 注入的按键）
         readonly bool[] physDown = new bool[256];
+        // 真正传递给系统的按键状态（被钩子吞掉的键系统是看不到的）
+        readonly bool[] deliveredDown = new bool[256];
         readonly bool[] suppressedDown = new bool[256];
         readonly bool[] swallowUp = new bool[256];
 
@@ -924,7 +985,10 @@ namespace VoicePaste
             };
 
             for (int i = 0; i < modifiers.Length; i++)
+            {
                 physDown[modifiers[i]] = Native.IsKeyDown(modifiers[i]);
+                deliveredDown[modifiers[i]] = physDown[modifiers[i]];
+            }
         }
 
         // -----------------------------------------------------------------
@@ -1002,35 +1066,42 @@ namespace VoicePaste
 
                         if (isTalkKey)
                         {
+                            bool isMainKey = talkSpec.MainVk != 0 && vk == talkSpec.MainVk;
+
                             if (isDown)
                             {
-                                if (logicalTalking || state != SessionState.Idle || blockedUntilRelease)
+                                if (isMainKey
+                                    && (logicalTalking || state != SessionState.Idle
+                                        || blockedUntilRelease || talkSpec.IsSatisfied(physDown)))
                                 {
-                                    // 已经开始说话（或正在处理上一条结果）：全部吞掉。
+                                    // 热键中的主键（例如 Ctrl+Alt+V 的 V）：吞掉，
+                                    // 避免把字符输入到文档里。
                                     swallow = true;
-                                    swallowUp[vk] = true;
+                                    suppressedDown[vk] = true;
                                 }
-                                else if (triggerSpec != null && triggerSpec.RequiresModifierVk(vk))
+                                else if (talkSpec.IsSatisfied(physDown))
                                 {
-                                    // 这个键同时也是微信语音热键的一部分，让它的
-                                    // keydown 正常传递，微信输入法才能看到它。
-                                    // keyup 在说话结束后仍会被吞掉，避免弹出开始菜单。
-                                    swallow = false;
-                                }
-                                else
-                                {
-                                    // 热键里但不是语音热键需要的键：按下时先吞掉。
+                                    // 凑齐热键的最后一个键：吞掉。否则 Alt+Shift /
+                                    // Ctrl+Shift 这类组合会被 Windows 当成“切换输入法”，
+                                    // 把微信输入法切走，语音热键就完全没反应了。
+                                    // 这个键由程序注入给微信（见 PressVoiceTrigger）；
+                                    // 按下被吞掉的键，松开时也会一并吞掉。
                                     swallow = true;
                                     suppressedDown[vk] = true;
                                 }
                             }
                             else
                             {
-                                swallow = logicalTalking || suppressedDown[vk] || swallowUp[vk];
+                                // 只吞掉“按下时被吞掉”的键的松开，其余全部放行。
+                                // 修饰键的松开必须放行，否则会卡住 Shift/Alt 等。
+                                swallow = suppressedDown[vk];
                                 suppressedDown[vk] = false;
                                 swallowUp[vk] = false;
                             }
                         }
+
+                        // 记录系统真正收到的按键状态：被吞掉的键对系统来说是没按下的。
+                        deliveredDown[vk] = isDown && !swallow;
 
                         if (isDown && !wasDown
                             && !logicalTalking
@@ -1041,7 +1112,6 @@ namespace VoicePaste
                             logicalTalking = true;
                             int id = ++nextSessionId;
                             activeSessionId = id;
-                            AddDownTalkKeysToSwallowUp();
                             Post((Action)(() => BeginTalk(id)));
                         }
                         else if (isUp && logicalTalking && !talkSpec.IsSatisfied(physDown))
@@ -1054,6 +1124,14 @@ namespace VoicePaste
 
                         if (isUp && blockedUntilRelease && !AnyTalkKeyDown())
                             blockedUntilRelease = false;
+
+                        // 松开热键时如果还有键没放（比如先放开 Shift 再放开 Alt），
+                        // 等全部松开后再释放注入的微信语音热键。
+                        if (isUp && pendingTriggerRelease && !AnyTalkKeyDown())
+                        {
+                            pendingTriggerRelease = false;
+                            Post((Action)ReleaseVoiceTrigger);
+                        }
 
                         if (swallow) return (IntPtr)1;
                     }
@@ -1080,15 +1158,6 @@ namespace VoicePaste
             {
                 try { action(); }
                 catch { }
-            }
-        }
-
-        void AddDownTalkKeysToSwallowUp()
-        {
-            for (int vk = 0; vk < 256; vk++)
-            {
-                if (physDown[vk] && talkSpec.IsPartOfHotkey(vk))
-                    swallowUp[vk] = true;
             }
         }
 
@@ -1131,6 +1200,8 @@ namespace VoicePaste
 
             pendingText = "";
             lastText = "";
+            lastComposedText = "";
+            lastComposedAt = DateTime.UtcNow;
             loggedWait = false;
             pasteWaits = 0;
             savedClipboardValid = false;
@@ -1159,7 +1230,14 @@ namespace VoicePaste
             if (state != SessionState.Capturing) return;
 
             Log("松开 " + talkSpec.Spec + "，等待识别结果...");
-            ReleaseVoiceTrigger();
+            if (AnyTalkKeyDown())
+            {
+                pendingTriggerRelease = true;
+            }
+            else
+            {
+                ReleaseVoiceTrigger();
+            }
 
             state = SessionState.Waiting;
             releasedAt = DateTime.UtcNow;
@@ -1262,12 +1340,12 @@ namespace VoicePaste
             if (triggerSpec.MainVk != 0)
                 SendTriggerKey(triggerSpec.MainVk);
 
-            Log("已模拟语音热键: " + triggerSpec.Spec);
+            Log("已模拟语音热键: " + triggerSpec.Spec
+                + "（注入按键: " + DescribeInjectedKeys() + "）");
 
-            if (Config.Debug)
             {
                 IntPtr fg = Native.GetForegroundWindow();
-                Log("模拟语音热键后前台: " + Native.GetWindowTitle(fg)
+                Log("热键注入后前台: " + Native.GetWindowTitle(fg)
                     + " / 0x" + fg.ToInt64().ToString("X")
                     + "，捕获框 focused=" + box.Focused);
             }
@@ -1277,16 +1355,10 @@ namespace VoicePaste
         {
             if (!needed) return;
 
-            bool leftDown = physDown[leftVk];
-            bool rightDown = physDown[rightVk];
-
-            bool alreadyDown;
-            if (side < 0) alreadyDown = leftDown;
-            else if (side > 0) alreadyDown = rightDown;
-            else alreadyDown = leftDown || rightDown;
-
-            if (alreadyDown) return;
-
+            // 不管物理键是否按着，都把语音热键完整注入一遍（左/右指定侧）。
+            // 实测：微信输入法只认“自己看到完整组合键”的情况，
+            // 物理 Alt + 注入 Win 这种混合它不触发；但两颗都注入就能触发。
+            // 物理键也会在松开后由 ReleaseVoiceTrigger 同等释放，不会卡键。
             int vk = side > 0 ? rightVk : leftVk;
             SendTriggerKey(vk);
         }
@@ -1301,6 +1373,19 @@ namespace VoicePaste
             {
                 Log("模拟按键失败: VK=0x" + vk.ToString("X2"));
             }
+        }
+
+        string DescribeInjectedKeys()
+        {
+            if (injectedTriggerKeys.Count == 0) return "无（组合键已由物理按键构成）";
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < injectedTriggerKeys.Count; i++)
+            {
+                if (i > 0) sb.Append('+');
+                sb.Append("0x").Append(injectedTriggerKeys[i].ToString("X2"));
+            }
+            return sb.ToString();
         }
 
         void ReleaseVoiceTrigger()
@@ -1335,8 +1420,23 @@ namespace VoicePaste
                 return;
             }
 
-            string current = box.Text;
+            string composed = Native.GetCompositionText(box.Handle);
+            string current = box.Text + composed;
             DateTime now = DateTime.UtcNow;
+
+            if (composed.Length > 0)
+            {
+                // 微信输入法的语音结果先写在 IME 合成串里，TextBox.Text 看不到；
+                // 记住最后看到的内容，防止合成串被清空时把文字一起丢掉。
+                lastComposedText = current;
+                lastComposedAt = now;
+            }
+            else if (current.Length == 0
+                     && lastComposedText.Length > 0
+                     && (now - lastComposedAt).TotalMilliseconds < 3000)
+            {
+                current = lastComposedText;
+            }
 
             if (!string.Equals(current, lastText, StringComparison.Ordinal))
             {
@@ -1346,6 +1446,7 @@ namespace VoicePaste
                 {
                     IntPtr fg = Native.GetForegroundWindow();
                     Log("捕获文字长度: " + current.Length
+                        + "（合成串 " + composed.Length + "）"
                         + "，前台: " + Native.GetWindowTitle(fg));
                 }
             }
@@ -1371,11 +1472,11 @@ namespace VoicePaste
                     }
                 }
             }
-            else if ((now - releasedAt).TotalMilliseconds >= NoTextTimeoutMs)
+            else if ((now - releasedAt).TotalMilliseconds >= Config.NoTextTimeoutMs)
             {
                 pollTimer.Stop();
 
-                string msg = "超时：松开热键后 " + (NoTextTimeoutMs / 1000)
+                string msg = "超时：松开热键后 " + (Config.NoTextTimeoutMs / 1000)
                     + " 秒仍未捕获到文字。请确认微信语音已启用、voice_trigger_hotkey 配置正确。";
                 Log(msg);
                 Console.WriteLine("[警告] " + msg);
