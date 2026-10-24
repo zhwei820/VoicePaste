@@ -186,9 +186,6 @@ namespace VoicePaste
         // WM_SYSCOMMAND / SC_MONITORPOWER 的 lParam：2 = 关闭显示器，-1 = 打开
         public const int MONITOR_OFF = 2;
 
-        public const uint SMTO_ABORTIFHUNG = 0x0002;
-        public static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
-
         public const uint INPUT_KEYBOARD = 1;
         public const uint KEYEVENTF_KEYUP = 0x0002;
         public const uint LLKHF_INJECTED = 0x10;
@@ -317,11 +314,6 @@ namespace VoicePaste
 
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-        // 广播 SC_MONITORPOWER 关闭显示器（不锁屏、不休眠）。
-        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        public static extern IntPtr SendMessageTimeout(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam,
-            uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
         [DllImport("imm32.dll")]
         public static extern IntPtr ImmGetContext(IntPtr hWnd);
@@ -1613,6 +1605,15 @@ namespace VoicePaste
                         ? (physDown[Native.VK_LWIN] ? Native.VK_LWIN : Native.VK_RWIN)
                         : 0;
                     deliveredDown[vk] = false;
+
+                    // 主键被吞后，系统看到的是“Alt 单独按了一下”，松开时会激活
+                    // 前台程序的菜单栏；趁 Alt 还按着注入一个 VK_NONAME 垫在中间。
+                    if (deliveredDown[Native.VK_LMENU] || deliveredDown[Native.VK_RMENU])
+                    {
+                        Native.SendKey(Native.VK_NONAME, false);
+                        Native.SendKey(Native.VK_NONAME, true);
+                    }
+
                     Log("息屏热键 " + screenOffSpec.Spec + "：关闭显示器（不锁屏）");
                     return true;
                 }
@@ -1649,7 +1650,7 @@ namespace VoicePaste
                     // 前台是提权窗口时 UIPI 会拦住 SendInput：宁可放行真实松开
                     // （会亮屏/弹开始菜单），也不能让 Win 键卡住。
                     Log("息屏热键：注入按键被 UIPI 拦下，放行 Win 松开（可能会亮屏）");
-                    deliveredDown[vk] = true;
+                    swallow = false;
                 }
             }
 
@@ -1686,18 +1687,13 @@ namespace VoicePaste
         // 只关闭显示器（不锁屏、不休眠）：动鼠标或按任意键即亮屏，回到原来的桌面。
         void TurnOffMonitor()
         {
-            try
-            {
-                IntPtr unused;
-                Native.SendMessageTimeout(Native.HWND_BROADCAST, Native.WM_SYSCOMMAND,
-                    new IntPtr(Native.SC_MONITORPOWER), new IntPtr(Native.MONITOR_OFF),
-                    Native.SMTO_ABORTIFHUNG, 1000, out unused);
+            // 发给自己的窗口交给 DefWindowProc 处理，不用 HWND_BROADCAST：
+            // 广播会在钩子所在的 UI 线程上逐个等所有顶层窗口，卡久了钩子会被系统卸掉。
+            if (Native.PostMessage(Handle, Native.WM_SYSCOMMAND,
+                    new IntPtr(Native.SC_MONITORPOWER), new IntPtr(Native.MONITOR_OFF)))
                 Log("显示器已关闭（未锁屏）：动一下鼠标或按任意键唤醒");
-            }
-            catch (Exception ex)
-            {
-                Log("关闭显示器失败: " + ex.Message);
-            }
+            else
+                Log("关闭显示器失败: Win32 错误 " + Marshal.GetLastWin32Error());
         }
 
         void Post(Action action)
