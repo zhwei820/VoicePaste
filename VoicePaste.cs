@@ -5,20 +5,21 @@
  * 窗口；在终端等会自行回显输入的地方，文字会被插入两遍。
  *
  * 工作流程：
- *   1) 按住 talk_hotkey（默认 Shift+Alt）时，记住当前前台窗口；
+ *   1) 按住 talk_hotkey（与微信输入法的语音快捷键相同，默认 Win+Alt）时，
+ *      记住当前前台窗口；
  *   2) 把焦点切到一个几乎不可见、但真实可聚焦的捕获文本框；
- *   3) 吞掉自己的热键，并模拟 voice_trigger_hotkey（默认 Win+Alt）
- *      真正调起微信语音；
- *   4) 松开热键后，微信把识别结果提交到捕获框；
+ *   3) 微信输入法自己响应这个真实按键，开始语音输入；
+ *      （实测微信输入法会忽略 SendInput 注入的按键，所以程序不做按键模拟）
+ *   4) 微信把识别结果写进捕获框的 IME 合成串；程序直接读合成串；
  *   5) 轮询捕获框，文字停止增长 commit_delay_ms 后：
  *      写入剪贴板 → 切回原窗口 → Ctrl+V 粘贴；
  *   6) 清空并隐藏捕获框，等待下一次说话。
  *
- * 这是前台控制台程序：命令行启动后一直挂在前台，按 Ctrl+C 退出。
+ * 编译为后台程序（无控制台窗口），常驻托盘：右键托盘图标可查看日志、退出。
  * 纯 .NET Framework + WinForms，无第三方依赖。
  *
  * 用 Windows 自带 csc 编译（兼容 C# 5）：
- *   csc.exe /nologo /optimize+ /t:exe /out:VoicePaste.exe VoicePaste.cs
+ *   csc.exe /nologo /optimize+ /t:winexe /out:VoicePaste.exe VoicePaste.cs
  */
 
 using System;
@@ -44,6 +45,7 @@ namespace VoicePaste
         public static bool PasteOnFinish = true;
         public static bool RestoreClipboard = false;
         public static bool Debug = false;
+        public static bool DebugKeys = false;
 
         public static void Load(string path)
         {
@@ -99,6 +101,10 @@ namespace VoicePaste
 
                         case "debug":
                             Debug = ParseBool(value, Debug);
+                            break;
+
+                        case "debug_keys":
+                            DebugKeys = ParseBool(value, DebugKeys);
                             break;
                     }
                 }
@@ -478,6 +484,17 @@ namespace VoicePaste
             return left || right;
         }
 
+        // 两个热键是否是同一个组合（忽略书写顺序，例如 Shift+Alt 与 Alt+Shift）
+        public bool SameAs(HotkeySpec other)
+        {
+            if (other == null) return false;
+            return NeedCtrl == other.NeedCtrl && NeedAlt == other.NeedAlt
+                && NeedShift == other.NeedShift && NeedWin == other.NeedWin
+                && CtrlSide == other.CtrlSide && AltSide == other.AltSide
+                && ShiftSide == other.ShiftSide && WinSide == other.WinSide
+                && MainVk == other.MainVk;
+        }
+
         // 这个物理按键是否属于本热键（用来决定是否吞掉按键）
         public bool IsPartOfHotkey(int vk)
         {
@@ -855,6 +872,10 @@ namespace VoicePaste
         bool loggedWait;
         int pasteWaits;
 
+        // 程序热键与微信输入法热键相同时：完全透传，不注入任何按键。
+        // 实测微信输入法会忽略 SendInput 注入的按键，所以只能“跟着它的真实热键走”。
+        bool passThroughTrigger;
+
         // 模拟语音热键时真正由我们按下的键
         bool triggerActive;
         bool pendingTriggerRelease;
@@ -875,6 +896,8 @@ namespace VoicePaste
 
         IntPtr hookHandle = IntPtr.Zero;
         Native.LowLevelKeyboardProc hookProc;
+
+        NotifyIcon tray;
 
         public CaptureForm(string lp)
         {
@@ -917,7 +940,26 @@ namespace VoicePaste
             restoreTimer.Interval = 350;
             restoreTimer.Tick += RestoreTick;
 
-            Log("启动 VoicePaste（前台运行，Ctrl+C 退出）");
+            // 托盘图标：程序没有可见窗口，靠它确认“还活着”，也提供退出入口。
+            ContextMenuStrip menu = new ContextMenuStrip();
+            ToolStripItem hint = menu.Items.Add("按住 " + Config.TalkHotkey + " 说话，松开自动粘贴");
+            hint.Enabled = false;
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("打开日志", null, delegate { OpenPath(logPath); });
+            menu.Items.Add("打开配置文件", null, delegate
+            {
+                OpenPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "voicepaste.conf"));
+            });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("退出 VoicePaste", null, delegate { DoExit(); });
+
+            tray = new NotifyIcon();
+            tray.Icon = SystemIcons.Application;
+            tray.Text = "VoicePaste 已运行（按住 " + Config.TalkHotkey + " 说话）";
+            tray.ContextMenuStrip = menu;
+            tray.Visible = true;
+
+            Log("启动 VoicePaste（后台运行，托盘图标可退出）");
         }
 
         // 不显示在 Alt+Tab / 任务栏里
@@ -928,6 +970,31 @@ namespace VoicePaste
                 CreateParams cp = base.CreateParams;
                 cp.ExStyle |= Native.WS_EX_TOOLWINDOW;
                 return cp;
+            }
+        }
+
+        public void ShowReadyBalloon()
+        {
+            try
+            {
+                tray.ShowBalloonTip(2000, "VoicePaste 已运行",
+                    "按住 " + Config.TalkHotkey + " 说话，松开自动粘贴。\n"
+                    + "右键托盘图标可查看日志或退出。",
+                    ToolTipIcon.Info);
+            }
+            catch
+            {
+            }
+        }
+
+        static void OpenPath(string path)
+        {
+            try
+            {
+                if (File.Exists(path)) Process.Start("notepad.exe", "\"" + path + "\"");
+            }
+            catch
+            {
             }
         }
 
@@ -951,18 +1018,12 @@ namespace VoicePaste
                 return false;
             }
 
-            if (string.Equals(Config.TalkHotkey.Trim(), Config.VoiceTriggerHotkey.Trim(), StringComparison.OrdinalIgnoreCase))
-            {
-                string msg = "talk_hotkey 与 voice_trigger_hotkey 相同，可能互相冲突";
-                Log("警告：" + msg);
-                Console.WriteLine("[警告] " + msg);
-            }
+            passThroughTrigger = talkSpec.SameAs(triggerSpec);
 
-            if (talkSpec.MainVk != 0 && talkSpec.MainVk == triggerSpec.MainVk)
+            if (passThroughTrigger)
             {
-                string msg = "两个热键使用了相同的主键，语音模拟可能失效";
-                Log("警告：" + msg);
-                Console.WriteLine("[警告] " + msg);
+                Log("说话热键 = 微信语音热键（" + talkSpec.Spec + "）：透传模式，不注入按键。"
+                    + "请确保微信输入法里的语音快捷键也是 " + talkSpec.Spec);
             }
 
             // 先强制创建窗口句柄；之后键盘钩子里的 BeginInvoke 才能工作。
@@ -1055,6 +1116,13 @@ namespace VoicePaste
 
                     // 只忽略本程序自己注入的按键，避免误触发和递归；
                     // 其他程序（例如键盘映射工具）注入的按键仍然当作正常输入。
+                    if (Config.DebugKeys)
+                    {
+                        Log("按键 vk=0x" + vk.ToString("X2") + (isDown ? " down" : " up")
+                            + (injected ? " (注入)" : "") + (ourInjection ? " (本程序)" : "")
+                            + " 状态=" + state + " talking=" + logicalTalking);
+                    }
+
                     if (!ourInjection && vk >= 0 && vk < 256)
                     {
                         bool wasDown = physDown[vk];
@@ -1068,7 +1136,13 @@ namespace VoicePaste
                         {
                             bool isMainKey = talkSpec.MainVk != 0 && vk == talkSpec.MainVk;
 
-                            if (isDown)
+                            if (passThroughTrigger)
+                            {
+                                // 透传模式：一个键都不吞，必须让微信输入法自己看到真实按键，
+                                // 否则它的语音会话根本不会开始。
+                                swallow = false;
+                            }
+                            else if (isDown)
                             {
                                 if (isMainKey
                                     && (logicalTalking || state != SessionState.Idle
@@ -1090,7 +1164,7 @@ namespace VoicePaste
                                     suppressedDown[vk] = true;
                                 }
                             }
-                            else
+                            else if (!passThroughTrigger)
                             {
                                 // 只吞掉“按下时被吞掉”的键的松开，其余全部放行。
                                 // 修饰键的松开必须放行，否则会卡住 Shift/Alt 等。
@@ -1221,7 +1295,8 @@ namespace VoicePaste
             }
 
             ShowCapture();
-            PressVoiceTrigger();
+            if (!passThroughTrigger)
+                PressVoiceTrigger();
         }
 
         void EndTalk(int sessionId)
@@ -1230,13 +1305,16 @@ namespace VoicePaste
             if (state != SessionState.Capturing) return;
 
             Log("松开 " + talkSpec.Spec + "，等待识别结果...");
-            if (AnyTalkKeyDown())
+            if (!passThroughTrigger)
             {
-                pendingTriggerRelease = true;
-            }
-            else
-            {
-                ReleaseVoiceTrigger();
+                if (AnyTalkKeyDown())
+                {
+                    pendingTriggerRelease = true;
+                }
+                else
+                {
+                    ReleaseVoiceTrigger();
+                }
             }
 
             state = SessionState.Waiting;
@@ -1697,6 +1775,13 @@ namespace VoicePaste
             RemoveKeyboardHook();
             HideCapture();
 
+            if (tray != null)
+            {
+                tray.Visible = false;
+                tray.Dispose();
+                tray = null;
+            }
+
             Application.ExitThread();
         }
 
@@ -1710,6 +1795,13 @@ namespace VoicePaste
                 pollTimer.Dispose();
                 pasteTimer.Dispose();
                 restoreTimer.Dispose();
+
+                if (tray != null)
+                {
+                    tray.Visible = false;
+                    tray.Dispose();
+                    tray = null;
+                }
             }
 
             base.Dispose(disposing);
@@ -1760,15 +1852,34 @@ namespace VoicePaste
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            // 任何未处理异常只记日志，不让整个程序默默退出（否则热键就“失效”了）。
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
+            {
+                CaptureForm.Log("未处理异常(UI): " + e.Exception);
+            };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                CaptureForm.Log("未处理异常: " + e.ExceptionObject);
+            };
+
             CaptureForm form = new CaptureForm(logPath);
             if (!form.Initialize())
             {
                 form.Dispose();
-                Console.WriteLine("按任意键退出...");
-                try { Console.ReadKey(true); }
-                catch { }
+                try
+                {
+                    MessageBox.Show("VoicePaste 启动失败：键盘钩子安装失败，热键无法生效。\n\n"
+                        + "请查看日志：" + logPath,
+                        "VoicePaste", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                catch
+                {
+                }
                 return;
             }
+
+            form.ShowReadyBalloon();
 
             Console.WriteLine();
             Console.WriteLine("==============================================");

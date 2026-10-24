@@ -8,7 +8,7 @@
 
 ## 它解决什么问题
 
-微信输入法的语音输入（默认按住 `Shift+Alt` 说话）会把识别结果通过 IME 直接上屏到当前焦点窗口。
+微信输入法的语音输入（按住它在微信输入法里设置的语音快捷键说话，例如 `Win+Alt`）会把识别结果通过 IME 直接上屏到当前焦点窗口。
 在终端这类会自行回显输入的地方，文字就被插入两遍：
 
 ```
@@ -22,7 +22,7 @@ VoicePaste 的做法是：**把语音文字先接进一个临时捕获框，再�
 1. 你按住语音热键说话时，程序：
    - 记住当前前台窗口（也就是你想粘贴进去的那个窗口）；
    - 立刻把焦点切到一个几乎不可见、但真实可聚焦的捕获文本框；
-   - 吞掉你自己的热键，并**模拟微信语音的热键**（默认 `Win+Alt`）来真正调起微信语音。
+   - 不拦截、不模拟任何按键 —— 微信输入法自己响应你的真实按键（实测它会忽略程序伪造的按键）。
 2. 你松开热键后，微信识别完成，通过 IME 上屏 —— 文字进入的是**捕获框**而不是终端，所以不会被回显两次。
 3. 程序轮询捕获框，等文字停止增长（默认 600ms）后判定识别结束：
    - 读取整段文字 → 写入剪贴板；
@@ -36,13 +36,14 @@ VoicePaste 的做法是：**把语音文字先接进一个临时捕获框，再�
 - **去重复写**：语音文字不再在终端 / 编辑器中重复一遍。
 - **任意窗口可用**：Word、浏览器、聊天框、WSL 终端、VS Code 等，只要能粘贴就行。
 - **自动粘贴**：松键、识别结束后自动回到原窗口粘贴；也可设为只放剪贴板手动粘贴。
-- **可自定义热键**：
-  - `talk_hotkey`：程序自己的语音热键（说话用），默认 `Shift+Alt`；
-  - `voice_trigger_hotkey`：微信输入法语音的真实热键（由程序模拟按下），默认 `Win+Alt`。
+- **可自定义热键**：程序热键必须**和微信输入法里设置的语音快捷键完全一致**（默认 `Win+Alt`）。
+  - `talk_hotkey`：程序监听的语音热键（说话用）；
+  - `voice_trigger_hotkey`：微信输入法里的语音快捷键，两者相同即进入透传模式（不注入按键）。
 - **低层键盘钩子**：能识别左右 Shift / Win / Ctrl / Alt，支持组合键；并自动忽略程序自己注入的按键，避免误触发。
 - **可靠的焦点切换**：用 `AttachThreadInput` + `SetForegroundWindow` 强制前台并聚焦捕获框，粘贴前同样强制切回目标窗口。
-- **智能结束判定**：文字停止增长达到 `commit_delay_ms` 即粘贴；松键后 5 秒仍无文字则超时收尾并给出提示。
+- **智能结束判定**：文字停止增长达到 `commit_delay_ms` 即粘贴；松键后 `no_text_timeout_ms`（默认 15 秒）仍无文字则超时收尾并给出提示。
 - **剪贴板可选恢复**：可配置粘贴后恢复剪贴板原有内容（默认关闭）。
+- **能读到 IME 合成串**：微信语音的结果先写在 IME 合成串里（`TextBox.Text` 看不到），程序用 `ImmGetCompositionString` 读取。
 - **调试日志**：控制台实时输出 + 同目录 `voicepaste.log`；`debug=true` 可打印捕获文字的变化细节。
 - **单实例**：启动时自动终止同名的残留进程。
 - **零依赖**：纯 .NET Framework + WinForms，无第三方库，编译为独立 exe。
@@ -61,15 +62,34 @@ VoicePaste.exe
 ```
 ==============================================
   VoicePaste 已运行
-  按住 Shift+Alt 说话，松开自动粘贴
+  按住 Win+Alt 说话，松开自动粘贴
   按 Ctrl+C 退出
 ==============================================
 ```
 
-然后正常使用微信输入法语音：**按住 `Shift+Alt` 说话 → 松开 → 文字自动出现在原窗口。**
+然后正常使用微信输入法语音：**按住 `Win+Alt` 说话 → 松开 → 文字自动出现在原窗口。**
 
-> 注意：`talk_hotkey` 必须与微信语音的真实热键不同，否则会互相冲突。
-> 如果你的微信语音热键不是 `Win+Alt`，请修改 `voice_trigger_hotkey` 保持一致。
+> 注意：`talk_hotkey` 必须**等于**微信输入法里的语音快捷键，程序才能接到结果。
+> 如果微信输入法里的语音快捷键不是 `Win+Alt`，请把 conf 里两行都改成一致的组合。
+>
+> 想让程序用 `Shift+Alt`？可以，但 `Alt+Shift` 是 Windows 的“切换输入法”热键，
+> 需要先在「设置 → 时间和语言 → 输入 → 高级键盘设置 → 输入语言热键」里关掉它，
+> 再把微信输入法的语音快捷键和 conf 里两行都改成 `Shift+Alt`。
+
+### 开机自启
+
+双击 `install-autostart.bat` 即可（会在「启动」文件夹里创建一个 `VoicePaste.lnk`，
+登录 Windows 后自动运行，窗口最小化）：
+
+```bat
+install-autostart.bat
+```
+
+取消：双击 `uninstall-autostart.bat`（或直接删除
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\VoicePaste.lnk`）。
+
+> 注意：自启的是当前目录下的 `VoicePaste.exe`。如果以后把文件夹挪走，
+> 需要重新运行一次 `install-autostart.bat`。
 
 ### 配置
 
@@ -77,12 +97,14 @@ VoicePaste.exe
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `talk_hotkey` | `Shift+Alt` | 程序自己的语音热键（按住它说话、松开自动粘贴） |
-| `voice_trigger_hotkey` | `Win+Alt` | 微信输入法语音的真实热键，程序会模拟它 |
+| `talk_hotkey` | `Win+Alt` | 程序监听的语音热键（按住它说话、松开自动粘贴） |
+| `voice_trigger_hotkey` | `Win+Alt` | 微信输入法里的语音快捷键，必须与上一行相同 |
+| `no_text_timeout_ms` | `15000` | 松键后多久没有文字就判定失败 |
 | `commit_delay_ms` | `600` | 捕获框文字停止增长多久后判定识别结束并粘贴 |
 | `paste_on_finish` | `true` | `false` 时只把文字放进剪贴板，不自动粘贴 |
 | `restore_clipboard` | `false` | 粘贴后是否恢复剪贴板原内容 |
 | `debug` | `false` | 打印捕获框文字变化等细节，便于排查 |
+| `debug_keys` | `false` | 打印每一个按键事件（排查热键用） |
 
 热键写法：修饰键 `Ctrl` / `Alt` / `Shift` / `Win` 用 `+` 连接，可带一个主键，
 例如 `Shift+Alt`、`Ctrl+Alt+V`、`F9`。
@@ -101,6 +123,8 @@ csc.exe /nologo /optimize+ /t:exe /out:VoicePaste.exe VoicePaste.cs
 | --- | --- |
 | `VoicePaste.cs` | 全部源码（配置、Win32 互操作、捕获窗口、键盘钩子、主程序） |
 | `voicepaste.conf` | 配置文件 |
+| `install-autostart.bat` | 设置开机自启（在「启动」文件夹创建快捷方式） |
+| `uninstall-autostart.bat` | 取消开机自启 |
 | `VoicePaste.exe` | 编译产物（未纳入版本库） |
 | `voicepaste.log` | 运行日志（未纳入版本库） |
 
