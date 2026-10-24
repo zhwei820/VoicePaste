@@ -897,6 +897,12 @@ namespace VoicePaste
         IntPtr hookHandle = IntPtr.Zero;
         Native.LowLevelKeyboardProc hookProc;
 
+        // Windows 7+ 在低层钩子回调超时后会静默卸载钩子（之后热键就完全没反应）。
+        // 这里每 2 秒注入一个无害的 F24 探一下钩子是否还活着，死了就自动重装。
+        Timer hookWatchdog;
+        int lastHookPingTick;
+        int hookReinstallCount;
+
         NotifyIcon tray;
 
         public CaptureForm(string lp)
@@ -939,6 +945,10 @@ namespace VoicePaste
             restoreTimer = new Timer();
             restoreTimer.Interval = 350;
             restoreTimer.Tick += RestoreTick;
+
+            hookWatchdog = new Timer();
+            hookWatchdog.Interval = 1000;
+            hookWatchdog.Tick += WatchdogTick;
 
             // 托盘图标：程序没有可见窗口，靠它确认“还活着”，也提供退出入口。
             ContextMenuStrip menu = new ContextMenuStrip();
@@ -1032,6 +1042,12 @@ namespace VoicePaste
             SyncPhysicalState();
             InstallKeyboardHook();
 
+            if (hookHandle != IntPtr.Zero)
+            {
+                lastHookPingTick = Environment.TickCount;
+                hookWatchdog.Start();
+            }
+
             return hookHandle != IntPtr.Zero;
         }
 
@@ -1097,6 +1113,31 @@ namespace VoicePaste
             }
         }
 
+        void WatchdogTick(object sender, EventArgs e)
+        {
+            uint since = unchecked((uint)(Environment.TickCount - lastHookPingTick));
+
+            if (hookHandle == IntPtr.Zero || since > 3000)
+            {
+                hookReinstallCount++;
+                if (hookReinstallCount <= 3 || hookReinstallCount % 20 == 0)
+                {
+                    Log("键盘钩子无响应（系统可能已静默卸载），自动重新安装"
+                        + "（第 " + hookReinstallCount + " 次）");
+                }
+
+                RemoveKeyboardHook();
+                // 重新读取真实按键状态，避免漏掉松键导致的“卡住”状态。
+                SyncPhysicalState();
+                InstallKeyboardHook();
+                lastHookPingTick = Environment.TickCount;
+                return;
+            }
+
+            Native.SendKey(Native.VK_F24, false);
+            Native.SendKey(Native.VK_F24, true);
+        }
+
         IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0)
@@ -1113,6 +1154,13 @@ namespace VoicePaste
                     bool injected = (info.flags & Native.LLKHF_INJECTED) != 0;
                     bool ourInjection = injected && info.dwExtraInfo == Native.InjectionSignature;
                     int vk = (int)info.vkCode;
+
+                    // 本程序注入的 F24 只是心跳：记一笔并吞掉，不参与热键逻辑。
+                    if (ourInjection && vk == Native.VK_F24)
+                    {
+                        if (isDown) lastHookPingTick = Environment.TickCount;
+                        return (IntPtr)1;
+                    }
 
                     // 只忽略本程序自己注入的按键，避免误触发和递归；
                     // 其他程序（例如键盘映射工具）注入的按键仍然当作正常输入。
@@ -1179,8 +1227,9 @@ namespace VoicePaste
 
                         if (isDown && !wasDown
                             && !logicalTalking
-                            && state == SessionState.Idle
                             && !blockedUntilRelease
+                            && (state == SessionState.Idle
+                                || (state == SessionState.Waiting && lastText.Trim().Length == 0))
                             && talkSpec.IsSatisfied(physDown))
                         {
                             logicalTalking = true;
@@ -1247,12 +1296,17 @@ namespace VoicePaste
 
         bool ModifiersOrTalkKeysDown()
         {
-            for (int vk = 0; vk < 256; vk++)
-            {
-                if (!physDown[vk]) continue;
-                if (HotkeySpec.IsModifierVk(vk)) return true;
-                if (talkSpec != null && talkSpec.IsPartOfHotkey(vk)) return true;
-            }
+            // 以系统真实按键状态为准：钩子如果漏掉松键事件，physDown 会卡住，
+            // 之前会导致“文字已捕获但永远等不到粘贴”。
+            if (Native.IsKeyDown(Native.VK_LSHIFT) || Native.IsKeyDown(Native.VK_RSHIFT)
+                || Native.IsKeyDown(Native.VK_LCONTROL) || Native.IsKeyDown(Native.VK_RCONTROL)
+                || Native.IsKeyDown(Native.VK_LMENU) || Native.IsKeyDown(Native.VK_RMENU)
+                || Native.IsKeyDown(Native.VK_LWIN) || Native.IsKeyDown(Native.VK_RWIN))
+                return true;
+
+            if (talkSpec != null && talkSpec.MainVk != 0 && Native.IsKeyDown(talkSpec.MainVk))
+                return true;
+
             return false;
         }
 
@@ -1263,13 +1317,28 @@ namespace VoicePaste
         {
             if (sessionId != activeSessionId || !logicalTalking) return;
 
+            // 上一轮还在等识别结果、而且一个字都没等到时，允许直接重新开始，
+            // 否则用户在这 15 秒内再按热键会毫无反应（看起来就像热键失效）。
+            bool retry = false;
+
             if (state != SessionState.Idle)
             {
-                Log("忽略新的说话热键：上一条语音还在处理中");
-                return;
+                if (state == SessionState.Waiting && lastText.Trim().Length == 0)
+                {
+                    retry = true;
+                    pollTimer.Stop();
+                    Log("上一次没有捕获到文字，重新开始说话");
+                }
+                else
+                {
+                    Log("忽略新的说话热键：上一条语音还在处理中");
+                    return;
+                }
             }
 
-            targetWindow = Native.GetForegroundWindow();
+            // 重试时不能把捕获框自己当成目标窗口。
+            if (!retry)
+                targetWindow = Native.GetForegroundWindow();
             state = SessionState.Capturing;
 
             pendingText = "";
@@ -1643,6 +1712,8 @@ namespace VoicePaste
 
             if (!Native.SendPaste())
                 Log("模拟 Ctrl+V 失败，文字已保留在剪贴板");
+            else
+                Log("已粘贴到原窗口（长度 " + pendingText.Length + "）");
 
             Console.WriteLine("[粘贴] " + pendingText);
             HideCapture();
@@ -1705,6 +1776,16 @@ namespace VoicePaste
             savedClipboardValid = false;
             savedClipboardText = null;
             targetWindow = IntPtr.Zero;
+            pendingTriggerRelease = false;
+
+            // 钩子可能漏掉松键事件（回调超时被系统跳掉），这时 logicalTalking
+            // 会一直卡在 true，之后所有热键都会被无视。每次会话结束都按
+            // 真实按键状态重新同步一次，保证下一次按键能正常触发。
+            SyncPhysicalState();
+            if (logicalTalking && !AnyTalkKeyDown()) logicalTalking = false;
+            if (blockedUntilRelease && !AnyTalkKeyDown()) blockedUntilRelease = false;
+            Array.Clear(suppressedDown, 0, suppressedDown.Length);
+            Array.Clear(swallowUp, 0, swallowUp.Length);
         }
 
         // -----------------------------------------------------------------
@@ -1764,11 +1845,12 @@ namespace VoicePaste
 
         void DoExit()
         {
-            Log("收到 Ctrl+C，退出");
+            Log("退出 VoicePaste");
 
             pollTimer.Stop();
             pasteTimer.Stop();
             restoreTimer.Stop();
+            hookWatchdog.Stop();
 
             ReleaseVoiceTrigger();
             logicalTalking = false;
@@ -1795,6 +1877,7 @@ namespace VoicePaste
                 pollTimer.Dispose();
                 pasteTimer.Dispose();
                 restoreTimer.Dispose();
+                hookWatchdog.Dispose();
 
                 if (tray != null)
                 {

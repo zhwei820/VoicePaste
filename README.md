@@ -44,28 +44,27 @@ VoicePaste 的做法是：**把语音文字先接进一个临时捕获框，再�
 - **智能结束判定**：文字停止增长达到 `commit_delay_ms` 即粘贴；松键后 `no_text_timeout_ms`（默认 15 秒）仍无文字则超时收尾并给出提示。
 - **剪贴板可选恢复**：可配置粘贴后恢复剪贴板原有内容（默认关闭）。
 - **能读到 IME 合成串**：微信语音的结果先写在 IME 合成串里（`TextBox.Text` 看不到），程序用 `ImmGetCompositionString` 读取。
-- **调试日志**：控制台实时输出 + 同目录 `voicepaste.log`；`debug=true` 可打印捕获文字的变化细节。
+- **调试日志**：同目录 `voicepaste.log`；`debug=true` 可打印捕获文字的变化细节。
 - **单实例**：启动时自动终止同名的残留进程。
 - **零依赖**：纯 .NET Framework + WinForms，无第三方库，编译为独立 exe。
-- **纯前台运行**：命令行启动后一直挂在前台，`Ctrl+C` 干净退出（卸载钩子、停止定时器）。
+- **后台常驻 + 托盘图标**：没有控制台窗口，右键托盘图标可查看日志、配置文件或退出。
+- **键盘钩子自愈**：Windows 在低层钩子回调超时后会**静默卸载**钩子（表现就是热键突然完全没反应、
+  微信语音直接接管）。程序每秒用无害的 F24 探一次钩子，发现被卸载就自动重装，
+  同时重新同步物理按键状态，避免“卡在说话中”导致后续热键全部失效。
 
 ## 使用方法
 
 ### 运行
 
-```bat
-VoicePaste.exe
-```
+双击 `VoicePaste.exe`（或从命令行启动）即可。
 
-启动后控制台会显示：
+程序在**后台运行，没有控制台窗口**，启动后会弹一次气泡提示，并在通知区域（托盘）
+显示一个图标。右键该图标可以：
 
-```
-==============================================
-  VoicePaste 已运行
-  按住 Win+Alt 说话，松开自动粘贴
-  按 Ctrl+C 退出
-==============================================
-```
+- 查看运行状态（当前热键）；
+- 打开 `voicepaste.log`；
+- 打开 `voicepaste.conf`；
+- 退出 VoicePaste。
 
 然后正常使用微信输入法语音：**按住 `Win+Alt` 说话 → 松开 → 文字自动出现在原窗口。**
 
@@ -79,7 +78,7 @@ VoicePaste.exe
 ### 开机自启
 
 双击 `install-autostart.bat` 即可（会在「启动」文件夹里创建一个 `VoicePaste.lnk`，
-登录 Windows 后自动运行，窗口最小化）：
+登录 Windows 后自动在后台运行，托盘出现图标）：
 
 ```bat
 install-autostart.bat
@@ -104,7 +103,7 @@ install-autostart.bat
 | `paste_on_finish` | `true` | `false` 时只把文字放进剪贴板，不自动粘贴 |
 | `restore_clipboard` | `false` | 粘贴后是否恢复剪贴板原内容 |
 | `debug` | `false` | 打印捕获框文字变化等细节，便于排查 |
-| `debug_keys` | `false` | 打印每一个按键事件（排查热键用） |
+| `debug_keys` | `false` | 打印每一个按键事件（排查热键用；会产生大量日志，排完请改回 `false`） |
 
 热键写法：修饰键 `Ctrl` / `Alt` / `Shift` / `Win` 用 `+` 连接，可带一个主键，
 例如 `Shift+Alt`、`Ctrl+Alt+V`、`F9`。
@@ -114,7 +113,7 @@ install-autostart.bat
 用 Windows 自带的 `csc`（兼容 C# 5）：
 
 ```bat
-csc.exe /nologo /optimize+ /t:exe /out:VoicePaste.exe VoicePaste.cs
+csc.exe /nologo /optimize+ /t:winexe /out:VoicePaste.exe VoicePaste.cs
 ```
 
 ## 文件说明
@@ -134,5 +133,10 @@ csc.exe /nologo /optimize+ /t:exe /out:VoicePaste.exe VoicePaste.cs
   微信语音是否已登录/可用；可开 `debug=true` 看日志。
 - **终端里仍重复**：说明文字没有进入捕获框，通常是焦点没切过去或被其他输入法/程序抢占，
   查看 `voicepaste.log` 中的「开始说话 / 捕获到文字长度」记录。
-- **热键无反应**：可能与其他软件的热键冲突；另外以管理员权限运行的窗口可能收不到普通权限进程的按键注入，遇到时用相同权限运行本程序。
-- **退出**：控制台按 `Ctrl+C`。
+- **热键无反应**：程序会自动检测并重装被系统卸载的键盘钩子（日志里会出现
+  「键盘钩子无响应…自动重新安装」）。如果仍然无效，检查托盘里程序是否在运行；
+  另外以管理员权限运行的窗口可能收不到普通权限进程的按键，遇到时用相同权限运行本程序。
+- **微信语音直接接管、没有粘贴**：先看 `voicepaste.log` 里有没有「开始说话」。
+  没有的话说明热键没被程序接住（钩子问题或热键不一致）；有的话看后续是否
+  「捕获到文字」，没有则是微信语音没真正开始或没识别出内容。
+- **退出**：右键托盘图标 →「退出 VoicePaste」。
